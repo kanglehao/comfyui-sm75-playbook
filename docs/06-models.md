@@ -67,6 +67,8 @@ ComfyUI/models/
 
 ## 加速 LoRA（按需）
 
+来源：**`lightx2v/Minimax-h3-Turbo`**（HF，公开、非 gated）。
+
 | 文件 | 步数 | 用途 |
 |---|---|---|
 | `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` | 8 | **默认选择**。速度与质量平衡最好 |
@@ -74,6 +76,33 @@ ComfyUI/models/
 | `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` | 8 | 参考图生视频（ref2v）专用 |
 
 **8 步与 4 步的 LoRA 不能混用步数**。用 4 步 LoRA 就必须把采样步数设成 4。
+
+### ⚠️ `_comfyui_` 后缀是必须的，不是可选美化
+
+同一个仓库里每个 LoRA 都有两个版本，键名格式不同：
+
+| 文件形态 | 键名 | `LoraLoaderModelOnly` 能加载吗 |
+|---|---|---|
+| `..._comfyui_bf16.safetensors` | ComfyUI diff 格式 | ✅ |
+| `..._bf16.safetensors`（无 `_comfyui_`） | PEFT 的 `base_model.model....lora_A.weight` | ❌ **加载"成功"，但键一个都不匹配** |
+
+第二种最坑：**不报错、不警告，LoRA 等于没加**。你会得到一个"跑了但没加速"的结果，
+然后把原因归到别处去。实测代价是白跑一整轮（4 步配置 491 s → 换成正确文件 163 s）。
+
+**不用打开 safetensors 看键名，看字节数就够了**：
+
+| | 字节数 | 约 |
+|---|---|---|
+| `_comfyui_` 版 | **1,956,193,000** / 1,956,192,992 | 1.82 GiB |
+| PEFT 版 | 1,383,677,808 / 1,383,677,888 | 1.29 GiB |
+
+差约 41%。对不上就是下错了文件。
+
+### 版本
+
+仓库现在有 v1.0 / v1.1 / v1.2 / v1.3（4 步另有 v0.1）。**本文档只在 v1.0 上实测过**，
+v1.1 起的文件命名规则相同、同样是 `_comfyui_` / PEFT 双版本，但没有跑过量。
+换版本前先用字节数确认格式，再自己量一轮。
 
 ---
 
@@ -120,6 +149,7 @@ ComfyUI/models/
 
 | 内容 | 仓库 |
 |---|---|
+| 加速 LoRA（turbo 4/8 步，含 `_comfyui_` 版本） | **`lightx2v/Minimax-h3-Turbo`** |
 | int8_convrot / int4 量化权重 | `Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot` |
 | 官方权重、VAE | `Comfy-Org/MiniMax-H3` |
 | 实验性 VAE / 量化 | `Kijai/MiniMax-H3-experimental` |

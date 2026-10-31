@@ -3,6 +3,70 @@
 All notable changes to this repository. Dates are the measurement date, not the
 publication date — the numbers in the docs were taken before they were written down.
 
+## [2.1.0] — 2026-10-31
+
+Everything here comes from one reader who actually ran the playbook on 0.43.2,
+single 2080 Ti, and reported back. He was right about most of it, including one
+mistake I had documented and then committed myself.
+
+### Fixed
+
+- **The shipped workflow contradicted the rule it shipped with.** `docs/11` warns
+  that a subgraph stores every promoted widget twice and the frontend reads the
+  INSTANCE copy — then `h3-i2v-2080ti-cutlass.json` shipped with the inner graph
+  set to 768×512 + `int4_convrot` while the instance still said 1344×768 +
+  `nvfp4_awq`, empty prompt. Loads fine, runs the wrong thing.
+  `inject_accel.py` now writes both copies and refuses to emit a file where they
+  disagree.
+- **No save node.** The subgraph's VIDEO output is a graph output, not a file.
+  The workflow computed a video and wrote nothing. Added `SaveVideo` at the top
+  level; `--save-video` attaches it automatically.
+- **LoRA source missing from the download table**, and the `_comfyui_` suffix was
+  never explained as mandatory. Same filename without it loads PEFT-keyed weights
+  that match nothing: no error, no warning, no acceleration. Sizes tell them
+  apart (1,956,193,000 vs 1,383,677,808 bytes).
+- `--cuda-device all` appeared in the "minimal set" at the top of `docs/02` and
+  then vanished from the full command at the bottom. Top section now splits
+  single-card vs dual-card properly.
+
+### Corrected
+
+- **Pitfall #1: the patch does not cover the hot path, and hasn't since 0.41.3.**
+  The reader saw one call per run on 0.43.2; the same is true on this repo's own
+  baseline. `comfy/ops.py:1071` runs `ck.int8_linear(..., convrot=True)` and never
+  dequantizes; `dequantize_int8_convrot_weight_dtype` is only reached from
+  `TensorWiseINT8Layout.dequantize()`. The 409/1101 counts came from versions
+  where dequantization *was* the per-step path. Section rewritten as a
+  version-gated check, and `scripts/check_patch_reach.py` now answers "is this
+  hook doing anything on my build" with an exit code.
+- The rowwise claim "only fastvideo quantizes token_refiner" is now phrased so it
+  no longer implies other models are safe. Frequency differs; the hardening
+  recommendation does not.
+- `docs/07` said "only three changes" to the blueprint. There were six, two of
+  which were absent rather than changed.
+- `--disable-dynamic-vram` was credited with more than the evidence supports. It
+  is now marked optional, with the missing ablation stated plainly.
+- `check_env.py` prints presence only and says so — it never proved a workflow
+  could load anything.
+
+### Added
+
+- `docs/13-third-party-verification.md` — his measurements (491 / 163 / 427 s at
+  768×512×56f, 19.4 s/it steady), the ten issues he raised with my per-item
+  verdict, and an explicit list of what I did **not** re-verify.
+- `scripts/check_patch_reach.py` — static call-chain check, exit 0/1/2.
+- `workflows/set-768x512-int4.json` — the `--set-json` input used to generate the
+  shipped workflow, so the derivation is reproducible rather than described.
+
+### Not fixed, deliberately
+
+- `PatchTuringCutlassAttention` still has no public distribution channel. The
+  README now says so above the fold instead of burying the dependency. The
+  binary is **not** mirrored here: no LICENSE, compiled `.pyd` only, no upstream
+  repository, no releases. Its mechanism is documented so the node can be
+  reimplemented (attention override + `set_model_attn1_replace`), and the MLP
+  chunking half does not need that binary at all.
+
 ## [2.0.0] — 2026-10-31
 
 Scope widened from "H3 acceleration" to "everything that had to be fixed to make

@@ -23,6 +23,45 @@ Node Type: SamplerCustomAdvanced
 形态 B 更像"真 bug"，所以很容易往显存、对齐、流、动态 VRAM 上去猜。
 **我们也是这么猜错的。**
 
+### 先确认：这个补丁在你的版本上还覆盖得着吗
+
+这是本篇唯一**会随版本失效**的结论，所以放在最前面。装补丁之前先花一分钟确认，
+否则你会上一种最难受的当：补丁装上了、日志干净、跑得也稳，但故障点早就不在它管的范围里。
+
+补丁钩的是 `dequantize_int8_convrot_weight_dtype`。它每步会不会被调用，
+取决于这个版本的采样主干怎么算 INT8 线性层：
+
+| 版本段 | INT8 线性层怎么算 | 反量化在热路径上吗 |
+|---|---|---|
+| 早期 kitchen（≤ 0.2.35 一类） | 先把权重反量化成 fp16/fp32，再走普通 GEMM | **在**。每个 linear 每步一次 |
+| 有 `int8_linear` 之后（本机 0.2.37 已如此） | GEMM 直接吃量化权重，不 materialize 反量化副本 | **不在**。只剩 LoRA 补丁这类显式路径 |
+
+三处源码证据（ComfyUI 0.41.3 + kitchen 0.2.37 实查，不是推断）：
+
+1. `comfy/ops.py:1071` —— 采样主干走 `quant_ops.ck.int8_linear(..., convrot=True)`
+2. `comfy_kitchen/tensor/int8.py:172` —— `dequantize_int8_convrot_weight_dtype`
+   唯一的真实调用点，属于 `TensorWiseINT8Layout.dequantize()`
+3. `comfy/` 目录下搜 `dequantize_int8_convrot_weight` —— **零引用**
+
+用脚本判（用跑 ComfyUI 的那个解释器）：
+
+```bash
+python scripts/check_patch_reach.py --comfyui <ComfyUI根>
+```
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 热路径还在反量化，补丁在干活 |
+| `1` | 热路径已绕过反量化，**补丁不再保护采样过程**（只在 LoRA 补丁时一轮一次） |
+| `2` | 判不出来，看它打印的调用点自己判断 |
+
+拿到 `1` 的时候要接受一个不太舒服的事实：**原始故障点已经不在覆盖范围内**。
+这时候如果再崩，正确的动作是抓失败现场的调用栈，而不是把重试次数调大——
+调大只会把真正的新问题也一起吞掉。
+
+> 下面「第 409 次 / 第 1101 次」这些计数，都是在**反量化还在热路径**的版本上观测到的。
+> 在 `int8_linear` 版本上你不会再看到这个量级的调用数，也就不能用它来验证补丁有效。
+
 ### 已经排除的方向（别再走一遍）
 
 - ❌ 全局 sage attention 开关
@@ -44,7 +83,8 @@ Node Type: SamplerCustomAdvanced
    stream、capture 状态，dump 里逐项验过，`peek_last=0 capture=0 drv_ctx_dev=0`
 2. **同一份入参原样重发必定成功**——这是最有价值的一条。它意味着状态是"可恢复"的，
    而不是输入本身有毒
-3. **失败点不固定**——观测到第 409 次、第 1101 次；不是某个固定形状触发
+3. **失败点不固定**——观测到第 409 次、第 1101 次；不是某个固定形状触发。
+   （这两个计数来自反量化还在热路径的版本，见上一节）
 4. **与预热无关**——早期版本在开头做了温启动，中途照样炸
 
 所以结论只到这一步：**这是一个原生算子在特定时序下返回的偶发错误，入参和版本都没问题。**
@@ -111,13 +151,17 @@ Node Type: SamplerCustomAdvanced
 
 触发条件是**特定模型的特定结构**：
 
-- 只有 `fastvideo_fasth3_8step_v2_pruned_int8_convrot` 这个模型把 `token_refiner` 也量化了
-  （其余 H3 int8 模型的 `token_refiner` 还是 BF16）
+- 在这些观测里，**持续**触发的是 `fastvideo_fasth3_8step_v2_pruned_int8_convrot`——
+  它把 `token_refiner` 也量化了（其余 H3 int8 模型的 `token_refiner` 还是 BF16）
 - 它的 `qkv_proj` 是 `[21504, 5376] int8`，k = 5376
 - Turing 的 `shared_memory_per_block` = 49152（48 KB），fusion 判定算下来要 54272 字节 → 装不下
 - 同时 `_should_use_convrot_fused_kernel` 要求 `k <= 5120 or k >= 8192`，
   **5376 正好落在被故意跳过的 5120 < k < 8192 区间**
 - 于是必然走回退路径，调用裸的 `quantize_int8_rowwise` —— 而它还没做加固
+
+⚠️ **别把上面当成"我的模型不是 fastvideo 就安全"**。`quantize_int8_rowwise` 在别的
+H3 int8 模型上也会被调到（权重准备、LoRA 补丁这类一次性路径，第三方实测 fl2va 也出现过）。
+区别只在**频次**：一次性路径撞上的概率低，热路径上撞上是必然。
 
 **结论：同一个加固要打两次，一个给 dequant，一个给 rowwise。**
 只用其中一个，另一个模型照样崩。

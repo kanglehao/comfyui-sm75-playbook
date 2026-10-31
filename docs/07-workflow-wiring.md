@@ -139,15 +139,40 @@ structural audit passed
 ## 仓库里的工作流说明
 
 `workflows/h3-i2v-2080ti-cutlass.json` 是从 **ComfyUI 官方 blueprint
-`Image to Video (MiniMax H3).json`** 派生的，改动只有三处：
+`Image to Video (MiniMax H3).json`** 派生的。该 blueprint 把整条链包在子图里，
+所以每个参数都有**两份**——这份工作流的第一版就栽在这里（见下面「曾经的错误」）。
+
+现在的改动：
 
 | 改动 | 原值 | 现值 | 原因 |
 |---|---|---|---|
 | 插入 `PatchTuringCutlassAttention` | 无 | MODEL 链末端 | 本仓库的核心 |
 | 文本编码器 | `qwen3vl_32b_..._nvfp4_awq` | `qwen3vl_32b_..._int4_convrot` | sm75 无 FP4 |
 | 分辨率 | 1344×768 | 768×512 | 22 GB 单卡可行，且是零 padding 尺寸 |
+| prompt | 空字符串 | blueprint 内层的 Vaporwave 示例 | 空 prompt 会出无意义画面 |
+| 采样步数 | 6 | 8 | 配 8 步 LoRA |
+| **落盘节点** | **无** | 顶层加 `SaveVideo` | **否则跑完什么都不写** |
 
-其余（prompt、帧数 73、采样器、调度器）保持官方默认，方便对照。
+其余（时长 5 s、seed、采样器、调度器）保持官方默认，方便对照。
+
+> **为什么必须有 SaveVideo**：子图的 VIDEO 输出是**图输出**，不是文件。
+> 没有落盘节点时，ComfyUI 会老老实实算完 8 分钟，然后 `output/` 里什么都没有——
+> 不报错、不警告。这是第一版第二个真 bug。
+
+### 曾经的错误：只改内层，实例没改
+
+第一版是用脚本改 `definitions.subgraphs[0].nodes` 里的值生成的，看起来没问题，
+但它没有碰顶层那个子图**实例节点**的 `widgets_values`。前端读的是实例那份，于是：
+
+| 参数 | 内层（改过） | 实例（实际执行） |
+|---|---|---|
+| 文本编码器 | `int4_convrot` | **`nvfp4_awq`** → sm75 加载即失败 |
+| 分辨率 | 768×512 | **1344×768** → 22 GB 必 OOM |
+| prompt | Vaporwave 示例 | **空字符串** |
+
+文件能加载、能执行，跑出来的东西和文档说的不是一回事。
+现在 `scripts/inject_accel.py` 强制两边一起写，并在写盘前做一致性审计，
+不一致就拒绝输出。判据见 [11-workflow-repair.md](11-workflow-repair.md)。
 
 > 为什么不直接提供别人做的成品工作流：那些工作流里通常捆了作者自己的节点、
 > 私有模型和自定义 UI。拿过来跑不通，你会以为是本仓库的问题。

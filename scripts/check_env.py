@@ -248,6 +248,9 @@ def main() -> int:
             mark = "OK " if info["present"] else "-- "
             size = f"{info['size_gib']} GiB" if info["size_gib"] else ""
             print(f"   {mark}{rel}  {size}")
+        print("   note: presence only. It does NOT mean a workflow can load them --")
+        print("         the dropdown value has to match the running instance exactly")
+        print("         (separator, subdirectory, subgraph instance copy). See docs/11.")
     if report["problems"]:
         print()
         print(" problems")

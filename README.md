@@ -19,6 +19,11 @@
 > **4. "文件存在"≠"能加载"≠"能执行"。**
 > 唯一可信的判据是运行中实例的 `/object_info` 加浏览器 `graphToPrompt()` 成功。
 
+> 🔻 **但是有一块我拿不到。**
+> 加速栈里最快的那一环（`PatchTuringCutlassAttention`）**没有公开下载渠道**，
+> 无 LICENSE、只有编译好的 `.pyd`。本仓库不转存，也不假装它随处可得。
+> 按这份文档走，你默认拿到四层里的三成。详见下面「先说清楚：第 3 层的节点拿不到」一节。
+
 ---
 
 ## 这个仓库里有四条线
@@ -60,6 +65,56 @@
 | 2 | **int8_convrot 权重** | 显存 −40%，读盘 −50% | 需要 sm75 的反量化核 |
 | 3 | **Turing CUTLASS 注意力** | 注意力段约 6× | 只能配 H3 类 DiT，`head_dim` 必须 128 |
 | 4 | **双卡 H3VM 引擎** | 端到端 1.6~2× | 峰值顶到 21.4/22 GiB，二采开不了 |
+
+> ⚠️ **第 3 层依赖的节点没有公开下载渠道**，见下面一节。按本仓库走到底，
+> 你默认拿到的是第 1、2、4 层。
+
+### ⚠️ 先说清楚：第 3 层的节点拿不到
+
+`comfyui-minimax-h3-turing` 提供第 3 层的 `PatchTuringCutlassAttention`。它的实际状态：
+
+| 项 | 情况 |
+|---|---|
+| LICENSE | **没有** |
+| 独立仓库 / Releases | **没有**（GitHub 同名的 `IvenKooLab/minimax-h3-turing` 是 MIT 的**手册**，72 个文件里没有一行节点代码，也没有 pyd） |
+| 核心内核 | 只有编译产物 `attn_t5_sm75.cp311/312/313-win_amd64.pyd`，**无源码** |
+
+**本仓库不转存它。** 无 LICENSE + 只发二进制 = 默认保留所有权利，我替你转存就是替你我担侵权。
+你在别处拿到这个包可以自己用，但它不构成本仓库的交付物。
+
+所以 [04-benchmarks.md](04-benchmarks.md) 里"注意力段 6×"那个数，是在**有该节点**的机器上量的。
+拿不到节点，别期待这个数字。
+
+#### 三条退路
+
+**A. 只用前两层。** int8_convrot 权重 + 步数蒸馏 LoRA，本仓库实测过，能跑、不崩，
+只是注意力段的加速拿不到。
+
+**B. 换一条加速路线。** `IvenKooLab/minimax-h3-turing`（MIT）是同一张 2080 Ti 22G 上的实测手册，
+有 T8 BlockCache（自报 −43%）、PDD 蒸馏、Turbo 三档的配方，附六个可导入工作流。
+**本仓库没有复现过它的数字**——引它是给一条出路，不是背书。用它之前先读它自己的
+`docs/07-upgrade-watch.md`（它把版本跟随问题单独记了一篇）。
+
+**C. 自己接管 attention。** 这个节点的机制是 ComfyUI 的公开 API，没有魔法。
+它挂在 `MODEL` 上，做的是：
+
+```python
+model_clone = model.clone()
+model_clone.model_options["transformer_options"]["optimized_attention_override"] = your_attention_fn
+model_clone.set_model_attn1_replace(wrapper, "diffusion_model", "blocks")
+model_clone.set_model_attn1_replace(wrapper, "diffusion_model", "token_refiner.blocks")
+```
+
+值得拆开看的是，它其实做**两件独立的事**：
+
+| 部分 | 参数 | 依赖那个 pyd 吗 |
+|---|---|---|
+| MLP 流式分块（2048 一块，省显存） | `streaming_chunk` | **不依赖** |
+| attention 接管 | `attention_mode`：`hadamard_dual_int8` / `t5_cutlass_sm75` / `pytorch_sdpa` / `disabled` | 前两档要，后两档是纯 PyTorch |
+
+也就是说：**只想省显存的话，用 `set_model_attn1_replace` + SDPA 就够了，不需要那个二进制。**
+想要加速比才需要写内核（sm75 上可用的是 DP4A / `mma.sync` INT8，不是 Triton——
+见 [03b-sageattention.md](03b-sageattention.md) 为什么 Triton 在 cc&lt;8 上不出张量核指令）。
 
 ### 实测数字
 
@@ -197,11 +252,11 @@ python scripts/check_env.py --comfyui /path/to/ComfyUI
 # 3. 装加固补丁（两个都要）
 cp -r patches/h3_convrot_warmup patches/h3_int8_guard  ComfyUI/custom_nodes/
 
-# 4. 装加速节点（第三方，见 docs/03）
+# 4. 装加速节点（第三方，**无公开下载渠道**，见下方「拿不到 CUTLASS 节点怎么办」）
 #    comfyui-minimax-h3-turing / ComfyUI-H3-MultiGPU / ComfyUI-MiniMax-H3-PDD-Acc
 
-# 5. 启动
-python main.py --disable-xformers --disable-pinned-memory --disable-dynamic-vram --cuda-device all
+# 5. 启动（单卡；双卡再加 --cuda-device all）
+python main.py --disable-xformers --disable-pinned-memory
 
 # 6. 加载加速版工作流
 #    workflows/h3-i2v-2080ti-cutlass.json
@@ -210,11 +265,27 @@ python main.py --disable-xformers --disable-pinned-memory --disable-dynamic-vram
 想改造自己的工作流，别手改 JSON——用脚本注入并做结构自检：
 
 ```bash
+# 先看它打算改什么
 python scripts/inject_accel.py --src 我的工作流.json --dry-run
-python scripts/inject_accel.py --src 我的工作流.json --out 加速版.json
+
+# 生成：改参数 + 插加速节点 + 加落盘节点
+python scripts/inject_accel.py --src 我的工作流.json --out 加速版.json \
+    --set width=768 --set height=512 \
+    --save-video video/h3
 ```
 
-手改 JSON 最常见的错是只改了一端 link，ComfyUI 不报错，补丁静默失效。
+三个必须知道的点：
+
+| 点 | 为什么 |
+|---|---|
+| `--set` 会**同时写内层和实例** | 子图参数存两份，前端读实例那份。只改内层 → 加载正常、执行旧值 |
+| 脚本**只同步你 --set 过的项** | 别的差异是蓝图自带的合法默认（比如 duration、seed），不该被覆盖 |
+| 写盘前有**一致性审计** | 两边不一致就拒绝输出，不给"看起来对"的文件 |
+
+prompt 很长时用 `--set-json`（见 `workflows/set-768x512-int4.json` 这个例子）。
+
+手改 JSON 最常见的两个错：只改了一端 link（ComfyUI 不报错，补丁静默失效），
+和只改了子图内层（同上，但更难发现）。
 
 ---
 
@@ -230,19 +301,22 @@ docs/
   03b-sageattention.md    SageAttention 2 在 sm75 上跑的是什么
   04-benchmarks.md        实测数据、阶段拆解、测量方法
   05-pitfalls.md          六个坑：崩溃、NVFP4、头数、缓存、s/it、上下文中毒
-  06-models.md            模型清单、格式选择、来源
-  07-workflow-wiring.md   节点接线规则与两种错接
+  06-models.md            模型清单、格式选择（_comfyui_ 判据）、来源
+  07-workflow-wiring.md   节点接线规则、两种错接、子图双份的代价
   10-frontend-compat.md   连线错乱 / 加载中止 / structuredClone
   11-workflow-repair.md   下拉值、子图双份、五步验证
   12-deps-and-download.md 依赖陷阱、HF 镜像、大文件下载
+  13-third-party-verification.md  别人在 0.43.2 上跑出来的结果 + 他挑出的错
 patches/
-  h3_convrot_warmup/      原生算子加固（dequant）
+  h3_convrot_warmup/      原生算子加固（dequant）—— 先用 check_patch_reach 判有没有用
   h3_int8_guard/          原生算子加固（rowwise）
 workflows/
-  h3-i2v-2080ti-cutlass.json
+  h3-i2v-2080ti-cutlass.json   从官方 blueprint 生成，含 SaveVideo
+  set-768x512-int4.json        生成它用的参数（--set-json 的输入）
 scripts/
   check_env.py            环境自检
-  inject_accel.py         加速节点注入 + 结构自检
+  check_patch_reach.py    补丁在你的版本上还覆盖得着吗（退出码即结论）
+  inject_accel.py         加速节点注入 + 实例同步 + 落盘节点 + 结构审计
 ```
 
 ---

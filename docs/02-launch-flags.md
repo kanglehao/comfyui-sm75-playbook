@@ -1,20 +1,28 @@
 # 02 · 启动参数
 
-## 实测使用的四个
+## 单卡与双卡
+
+单卡：
 
 ```
---disable-xformers --disable-pinned-memory --disable-dynamic-vram --cuda-device all
+--disable-xformers --disable-pinned-memory
 ```
 
-单卡可以去掉 `--cuda-device all`，其余三个保留。
+双卡再加一个（H3VM 引擎要靠它看到第二张卡）：
 
-这四个不是拍脑袋凑的。前两个决定**注意力走哪条路**，后两个决定**显存怎么管**：
+```
+--cuda-device all
+```
+
+本机长期还挂着 `--disable-dynamic-vram`，见下面「要不要开」那一节——
+**它不在最小集合里**，不加也能跑。
+
+前两个不是拍脑袋凑的，它们决定**注意力走哪条路**和**锁页内存怎么用**：
 
 | 参数 | 管什么 | 去掉会怎样 |
 |---|---|---|
 | `--disable-xformers` | 注意力后端 | CUTLASS 补丁被抢接管权，静默失效 |
-| `--disable-pinned-memory` | 锁页内存 | 长跑后加载阶段卡死或崩 |
-| `--disable-dynamic-vram` | 显存页调度 | aimdo 激进回收与 int8 原生核冲突 |
+| `--disable-pinned-memory` | 锁页内存 | 长时间跑之后加载阶段卡死或崩 |
 | `--cuda-device all` | 设备可见性 | 双卡引擎找不到第二张卡 |
 
 下面逐条说清目的和副作用。
@@ -92,11 +100,11 @@ print(mm.sage_attention_enabled())        # True 才算开了
 
 ---
 
-### `--disable-dynamic-vram`
+### `--disable-dynamic-vram`（可选，本机默认开着）
 
 **做什么**：关闭 ComfyUI 0.37 引入的 DynamicVRAM（`comfy_aimdo`），让权重按传统方式常驻/换出。
 
-**为什么加**：22 GB 的改卡上，DynamicVRAM 的按页 pin/unpin 太激进——
+**为什么加**：22 GB 的改卡上，DynamicVRAM 的按页 pin/unpin 比较激进——
 它会在段与段之间回收权重页，而 H3 的 int8 原生核直接拿张量地址去 launch，
 不经过 comfy 的 `vbar_fault` 补页路径。配套的 `--disable-pinned-memory` 是同一个目的：
 别让 aimdo 的缓冲策略和原生核抢内存。
@@ -105,10 +113,12 @@ print(mm.sage_attention_enabled())        # True 才算开了
 工作流照样崩在原生算子上。真正止血的是预热 + 有界重试补丁
 （见 [05-pitfalls.md](05-pitfalls.md) 坑 #1）。
 
-> 所以别把这两件事混在一起：`--disable-dynamic-vram` 管的是**显存策略稳定性**，
-> 补丁管的是**原生算子的偶发失败**。少了任何一个，你都还会崩。
+**要不要开**：本机是两个都开着跑稳的，但**没有做过"只开一个"的对照实验**，
+所以不能说是哪个在起作用。取舍很直接——关了动态显存调度，超大分辨率下更容易 OOM；
+开着，则在长序列上有更多换页动作。22G 卡上如果你不跑 1344×768 以上，开着更稳。
 
-**副作用**：显存调度不如动态模式灵活，超大分辨率下更容易 OOM。这是 22G 卡上的取舍。
+> 别把两件事混在一起：`--disable-dynamic-vram` 管的是**显存策略**，
+> 补丁管的是**原生算子的失败**。它们不是互为替代的关系，也没有证据表明缺一必崩。
 
 ---
 
@@ -161,12 +171,29 @@ tr '\0' ' ' < /proc/$(pgrep -f main.py | head -1)/cmdline
 
 ## 一份完整可用的启动命令
 
+单卡（最小集合）：
+
+```bash
+python main.py \
+  --port 8188 \
+  --disable-xformers \
+  --disable-pinned-memory
+```
+
+双卡（H3VM 引擎）：
+
 ```bash
 python main.py \
   --port 8188 \
   --disable-xformers \
   --disable-pinned-memory \
   --cuda-device all
+```
+
+本机实际还带一个（可选，理由见上）：
+
+```
+--disable-dynamic-vram
 ```
 
 排障时再加 `--verbose DEBUG`，但正常跑不要开——它会显著拖慢出图。
