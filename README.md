@@ -1,228 +1,277 @@
-# 让 MiniMax-H3 在 2080 Ti（sm75）上跑到可用速度
+# 2080 Ti（sm75）上的 ComfyUI：能跑、能修、能快
 
-> 一套在 **RTX 2080 Ti / Turing（sm_75）** 上把 ComfyUI + MiniMax-H3 视频生成从"能跑"推到"能用"的实测配方：
-> 每一步都有数字，每个被否掉的方案也都写了为什么否。
-
----
-
-## 如果你只记住一件事
-
-> **在 sm75 上不要再去编译 sageattention / triton 那一套。**
-> 用 `PatchTuringCutlassAttention` 一个节点替代，它内部是手写的 CUTLASS INT8 注意力核，
-> 不依赖 triton，装好就能用。
-> 真正的大头不在注意力，而在**步数蒸馏**和**权重格式**——这两项决定了你是 20 步还是 8 步、是 12 GB 还是 7 GB 的权重读取量。
-
-注意力只占端到端时间的四分之一左右。很多"9 倍加速"的教程把注意力当成了全部，所以在 8 步模型上收效甚微。
+> 一台双 RTX 2080 Ti 的机器，跑 ComfyUI 半年，踩完的坑和量出来的数。
+> 不是整合包，不是教程搬运——**每一节都能对应到一次真实的故障或一组真实的计时**。
 
 ---
 
-## 这是什么 / 能到什么速度
+## 如果你只记住四件事
 
-本仓库不是又一个整合包，而是一份**可核对的调优记录**：硬件前提、版本矩阵、启动参数、节点接线、
-实测耗时、以及踩过的坑。所有数字都来自同一台机器的重复测量，条件写在每一张表头上。
-
-参考量级（单张 2080 Ti 22G，768×432，124 帧 ≈ 5.2 s，8 步）：
-
-| 配置 | 每步耗时 | 采样段 | 端到端 |
-|---|---|---|---|
-| 全注意力基线 | 49.8 s/it | 398 s | 558 s（含冷加载）/ 432 s（热） |
-| + Turing CUTLASS 注意力 | 约 1/3 | — | — |
-| + 8 步蒸馏 LoRA | 步数 20 → 8 | 按比例 | — |
-| 双卡 H3VM 引擎（736×416 / 10 步） | 6.5 s/it | 65 s | **253 s** |
-
-> 不是"2080 Ti 能打 5090"，而是"2080 Ti 能从 10 分钟一条压到 4 分钟一条，且画面可用"。
+> **1. sm75 是分水岭，别照抄 4090 的方案。**
+> 加速器先看它有没有 Turing 的原生核，再看它自称几倍。
+>
+> **2. 真正的速度不在注意力上。**
+> 步数蒸馏和权重格式拿走了大部分收益；端到端时间里 **63% 是 VAE 解码**。
+>
+> **3. 升级前端之后，先怀疑"接管绘制函数"的扩展。**
+> 连线错乱、加载中止、`structuredClone` 失败，九成是它们。
+>
+> **4. "文件存在"≠"能加载"≠"能执行"。**
+> 唯一可信的判据是运行中实例的 `/object_info` 加浏览器 `graphToPrompt()` 成功。
 
 ---
 
-## 适用范围
+## 这个仓库里有四条线
 
-**适用**
+做了半年，实际动过的东西分四类。每条线都有独立文档，可以只看你需要的那条。
 
-- 显卡：RTX 2080 Ti / 2080 Super / 2070 等 **Turing（sm_75）** 卡；显存 11G 可跑 576×320 级别
-- 系统：Windows 10/11 + 便携版 ComfyUI，或 Linux
-- 模型：**MiniMax-H3**（本仓库的所有实测都在 H3 上做的）
+| 线 | 解决什么 | 文档 |
+|---|---|---|
+| **加速** | 2080 Ti 上把 H3 视频生成从 10 分钟压到 4 分钟 | [03](docs/03-acceleration-stack.md) · [04](docs/04-benchmarks.md) |
+| **崩溃加固** | `CUDA INT8 convrot/rowwise ... invalid argument` | [05](docs/05-pitfalls.md) · [patches/](patches/) |
+| **前端兼容** | 连线错乱、加载中止、子图值不生效 | [10](docs/10-frontend-compat.md) |
+| **工作流与依赖** | 下拉值红框、成片 ImportError、大文件下不完 | [11](docs/11-workflow-repair.md) · [12](docs/12-deps-and-download.md) |
 
-**不适用 / 请绕行**
+外加一篇 [SageAttention 2 在 sm75 上的真相](docs/03b-sageattention.md)——
+因为几乎每个人都在这上面浪费过时间。
 
-| 场景 | 原因 |
+---
+
+## 环境坐标
+
+| 项 | 值 |
 |---|---|
-| 50 系 / 40 系（sm_89+） | 用不着这套。直接上 sageattention 2 / FlashAttention，或官方 TensorRT 路径 |
-| 30 系（sm_86） | CUTLASS 核是按 sm75 特化的，30 系请走 sageattention |
-| 想靠注意力拿到 3 倍以上 | 在双卡/多卡引擎下注意力已经不是瓶颈，见 [docs/04-benchmarks.md](docs/04-benchmarks.md) |
-| 显存 < 11G | H3 的 int8 权重 + 32B 文本编码器放不下，先解决显存 |
+| GPU | RTX 2080 Ti ×2（22 GB 改卡，可用 21.66 GiB），`sm_75` |
+| ComfyUI | **0.41.3**（commit `8713616`） |
+| Python / torch | 3.13.6 / **2.12.1+cu132** |
+| 关键包 | comfy-kitchen **0.2.37**、comfy-aimdo 0.5.6 |
+| 前端 | comfyui_frontend_package 1.55.17 |
+| 节点包 | 141 个 |
+
+跑 `python scripts/check_env.py` 会输出一份可对照的报告。
 
 ---
 
-## 加速栈：五层，按收益排序
+## 加速：四层，按收益排序
 
-把"加速"当成一个整体是误判的根源。拆成五层之后，每一层该不该做、能拿多少，都很清楚。
-
-| 层 | 手段 | 典型收益 | 代价 |
+| 层 | 手段 | 收益 | 代价 |
 |---|---|---|---|
-| 1 | **步数蒸馏 LoRA**（20 步 → 8 步 / 4 步） | 2.5× | 画面细节略降，需配对应步数 |
-| 2 | **int8_convrot 权重**（代替 bf16） | 显存 −40%，读盘 −50% | 需要 sm75 兼容的反量化核 |
-| 3 | **Turing CUTLASS 注意力**（sm75 专用） | 注意力段 3× | 只能配 H3 类 DiT |
-| 3' | SageAttention 2（备选） | sm75 上收益有限 | 需定制 wheel，且与 3 互斥 |
-| 4 | **双卡 H3VM 引擎**（两张卡流水） | 端到端 1.6~2× | 显存顶到 21.4/22 GiB，没有余量 |
-| 5 | **VAE 解码**（当前无解） | 理论 60% | Sol-VAE 尚未被 ComfyUI 支持 |
+| 1 | **步数蒸馏 LoRA**（20 → 8 / 4 步） | 2.5× | 细节略降，步数必须配对 |
+| 2 | **int8_convrot 权重** | 显存 −40%，读盘 −50% | 需要 sm75 的反量化核 |
+| 3 | **Turing CUTLASS 注意力** | 注意力段约 6× | 只能配 H3 类 DiT，`head_dim` 必须 128 |
+| 4 | **双卡 H3VM 引擎** | 端到端 1.6~2× | 峰值顶到 21.4/22 GiB，二采开不了 |
 
-第 3 和 3' 是**二选一**：CUTLASS 节点通过 `optimized_attention_override` 接管注意力，
-会直接短路全局的 `--use-sage-attention`。也就是说两个都开时，sage 根本不参与计算。
-细节见 [docs/03b-sageattention.md](docs/03b-sageattention.md)。
+### 实测数字
 
-第 5 层是重点：**端到端 253 秒里有 160 秒在 VAE 解码和封装**。
-所以继续压注意力最多再省 20% 的 26%，不如去等 VAE 侧的支持。这一点在
-[docs/04-benchmarks.md](docs/04-benchmarks.md) 里有逐阶段拆解。
+单卡 768×432 / 124 帧 / 8 步：
+
+| 配置 | s/it | 采样段 | 端到端 |
+|---|---|---|---|
+| 全注意力基线 | 49.84 | 398 s | 432 s（热态） |
+| + Veda 稀疏（仅单卡） | 15.77 | 126 s | 163.5 s |
+
+双卡 H3VM 引擎 736×416 / 124 帧 / 10 步：**253 s**。
+
+### 但瓶颈已经不在注意力
+
+以那 253 秒为例：
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| 编码 / 条件准备 | ~28 s | 11% |
+| 10 步采样 | ~65 s | 26% |
+| **VAE 解码 + 音频 + 封装** | **~160 s** | **63%** |
+
+**继续优化注意力最多再省 20% 的 26%。** 真想再快，方向是 VAE
+（Sol-VAE 要 ComfyUI ≥ 0.44，当前版本选中即报 `VAE is invalid: None`）。
+
+完整数据、测量方法和反缓存处理见 [04-benchmarks.md](docs/04-benchmarks.md)。
 
 ---
 
 ## 已证伪的方案（别浪费时间）
 
-下面每一条都在这台机器上试过，或经过交叉验证后排除。写在最前面，是为了让别人少走一遍。
+每一条都试过，或经交叉验证后排除。
 
 | 方案 | 结论 | 依据 |
 |---|---|---|
-| `--fast fp16_accumulation` | ❌ **全黑画面 + 音频 EINVAL** | sm75 上两轮实测 |
-| `--vram-headroom N` | ❌ **必然 `illegal memory access`** | 7 次测试全崩，它只抬高保留下限，不降峰值 |
+| `--fast fp16_accumulation` | ❌ 全黑画面 + 音频 EINVAL | sm75 两轮实测 |
+| `--vram-headroom N` | ❌ 必然 `illegal memory access` | 7 次全崩；它只抬保留下限，不降峰值 |
 | `--disable-comfy-compiler` | ❌ 与 convrot 崩溃无关 | 关掉后仍崩在同一次调用 |
-| 换 comfy-kitchen 版本（0.2.33/34/35） | ❌ 逐位相同 | 三版 dequant 算子输出一致 |
-| Spark-H3 / Sol-H3 / Spectrum / Open-VC | ❌ 仅 SM89+/Blackwell | 官方与社区均确认不支持 sm75 |
-| FastH3 V2/V3 的"9 倍" | ⚠️ 8 步下质量崩塌 | 社区实测：高步与官方流差 <10% |
-| Veda 稀疏注意力（单卡裸流） | ✅ 3.16× | 仅限单卡；**接双卡引擎后收益归零**，见下 |
-| Veda + H3VM 双卡引擎 | ❌ 无效（±5% 噪声） | 引擎已把同形状压到 6.5 s/it，无可压缩空间 |
+| 换 comfy-kitchen 版本 | ❌ dequant 输出逐位相同 | 0.2.33/34/35 对比 |
+| 官方 sageattention 2 直接用 | ❌ Triton 在 cc<8 不发张量核指令 | `mma.sync` 计数 = 0 |
+| `--use-sage-attention` 叠加 CUTLASS 节点 | ❌ 静默失效 | `optimized_attention_override` 在最外层直接 return |
+| Spark-H3 / Sol-H3 / Spectrum / Open-VC | ❌ 仅 SM89+/Blackwell | 官方与社区均确认 |
+| Veda + 双卡引擎 | ❌ 收益归零（±5% 噪声） | 引擎已把同形状压到 6.5 s/it |
 | 二采（SelfLift）+ 双卡 | ❌ OOM | 需 946 MiB，GPU1 仅余 631 MiB |
-| `--use-sage-attention` 叠加 CUTLASS 节点 | ❌ 静默失效 | `optimized_attention_override` 在最外层直接 return，sage 不参与计算 |
-| 官方 PyPI 版 sageattention 2.x 直接用 | ❌ sm75 无 Triton 张量核路径 | 需打 sm75 补丁的定制 wheel，见 [03b](docs/03b-sageattention.md) |
 
-> Veda 那条值得单独说：它在单人单卡裸工作流上确实把 49.8 → 15.8 s/it，
-> 但那个"49.8"是**单卡稠密注意力**的基线，不是生产链的基线。
-> 拿它去乘生产链的 6.5 s/it，就变成了一个不存在的收益。
+> Veda 那条值得单独说：它的 3.16× 是**单卡稠密注意力**基线下的 3.16×。
+> 拿它去乘生产链的数字，就变成了一个不存在的收益。
+> 它自己的稀疏核在双卡链路上要跑 52.5 s，而整段采样才 65 s。
 
 ---
 
-## 六个坑
+## 崩溃加固：为什么需要两个补丁
 
-完整版见 [docs/05-pitfalls.md](docs/05-pitfalls.md)，这里只列标题：
+`CUDA INT8 convrot dequantization failed: invalid argument` 这个错，
+网上能查到的解释大多指向显存、对齐、动态 VRAM——**我们都排除过**。
 
-1. **`CUDA INT8 convrot dequantization failed: invalid argument`** —— 进程内第一次原生 kernel launch 的冷启动假失败，预热一次即可，不是显存/对齐/流的问题。
-2. **NVFP4 文本编码器在 sm75 上不可用** —— 必须换 `int4_convrot` 版本，否则加载即失败。
-3. **26 头 / 28 头 / 56 头模型不能混用注意力加速器** —— 头数不匹配会直接报 predictor 维度错误。
-4. **同 seed 重跑会命中 ComfyUI 执行缓存** —— 2 秒返回旧产物，看起来像"加速成功"。**验收必须换 seed，并比对产物 MD5。**
-5. **多卡引擎下进度条 s/it 不可信** —— 异步流水，进度条跑在工作前面，只能看端到端。
-6. **崩溃一次后 CUDA 上下文中毒** —— Linux 上必须重启服务进程，Windows 上必须重启 ComfyUI 进程。
+能确定的事实只有三条：
+
+1. 失败现场的所有静态参数都合法（形状/步长/dtype/连续性/16B 对齐/device/stream/capture）
+2. **同一份入参原样重发必定成功**
+3. 失败点不固定（观测到第 409 次、第 1101 次）
+
+所以结论只到"原生算子在特定时序下的偶发失败"，修法是**预热 + 有界重试**，
+而不是去调什么参数。
+
+同一台机器上还有第二个算子（`quantize_int8_rowwise`）会报同样的错，
+但只在把 `token_refiner` 也量化的模型上触发——因为 k=5376 正好落在
+fused kernel 被跳过的区间，加上 Turing 的 48 KB 共享内存上限，必然走未加固的回退路径。
+
+**两个补丁都要装**，见 [patches/](patches/)。它们放在 `custom_nodes/` 而不是
+`site-packages/`，因为后者会被 pip 重装冲掉。
+
+---
+
+## 前端兼容：四种炸法
+
+| 症状 | 根因 | 处置 |
+|---|---|---|
+| 连线变直角折线、端点不在插槽上 | `quick-connections` 的 Circuit Board 接管 `drawConnections`，与新前端槽位几何失配 | 改一个设置项，F5 即可 |
+| 连线整体放大偏移（仅在缩放≠100% 时） | mixlab 的 `td_background.js` 把 dpr 乘了两次 | 让覆盖函数透传给原生实现 |
+| 加载弹窗 `t.findInputSlot is not a function` | Impact-Pack 用 `stackTrace.includes()` 判断加载态，Vite 压缩后失效 | 补判据 + try/catch |
+| `structuredClone ... could not be cloned` | 某节点把 Proxy/类实例塞进 widget | 装一个序列化守卫 |
+
+共同规律：**升级前端后，优先怀疑所有接管 `drawConnections` / `drawNode` / `drawBackCanvas`
+的显示类扩展。** 判据是"所有工作流一起坏"，而不是某个文件坏。
+
+细节见 [10-frontend-compat.md](docs/10-frontend-compat.md)。
+
+---
+
+## 工作流修复：三条血泪规则
+
+1. **模型下拉值必须是反斜杠**
+   `/object_info` 给的是 `MiniMax-H3\xxx.safetensors`，写成 `/` 或裸名 → 红框报错，
+   哪怕磁盘上文件确实在。**校验只能用 `/object_info` 候选池精确比对，绝不能用 `os.path.exists`。**
+
+2. **子图的 widget 值存两份**
+   `definitions.subgraphs[].nodes[].widgets_values` 和实例节点的 `widgets_values`。
+   前端读的是**实例那份**，而实例的 `type` 是子图 UUID。
+   我们第一批改 552 处，抽检才发现漏了 109 处。
+
+3. **验证分五步，别停在第一步**
+   节点存在 → 下拉值匹配 → 浏览器能加载 → `graphToPrompt()` 成功 → 必填输入都接了。
+
+详见 [11-workflow-repair.md](docs/11-workflow-repair.md)。
+
+---
+
+## 依赖：升级后成片挂掉的两个真凶
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 几十个包同时 `ImportError: cannot import name 'HybridCache'` | transformers 5.x 移除了它 | `pip install --no-deps --upgrade peft==0.21.2` |
+| `cannot import name 'median_blur' from 'albucore'` | albucore 0.0.24 移除 | 需整套降级，别单独降 |
+
+**给嵌入式 Python 装包一律加 `--no-deps`。** 不加会把 `filelock`、`packaging`
+一路抬上去，然后 torch 生态开始随机报错。
+
+还有：别照节点包的 `requirements.txt` 装。典型反例是某个包写死 `numpy<=1.26.4`，
+照装会把 numpy 2.2.6 降下去，拖垮整个 torch 2.12。
+
+下载链路、HF 镜像、大文件分块重试见 [12-deps-and-download.md](docs/12-deps-and-download.md)。
 
 ---
 
 ## 复现步骤
 
-### 1. 确认硬件确实是 sm75
+```bash
+# 1. 确认硬件是 sm75
+python -c "import torch; print(torch.cuda.get_device_capability(0))"   # 期望 (7, 5)
+
+# 2. 全套自检
+python scripts/check_env.py --comfyui /path/to/ComfyUI
+
+# 3. 装加固补丁（两个都要）
+cp -r patches/h3_convrot_warmup patches/h3_int8_guard  ComfyUI/custom_nodes/
+
+# 4. 装加速节点（第三方，见 docs/03）
+#    comfyui-minimax-h3-turing / ComfyUI-H3-MultiGPU / ComfyUI-MiniMax-H3-PDD-Acc
+
+# 5. 启动
+python main.py --disable-xformers --disable-pinned-memory --disable-dynamic-vram --cuda-device all
+
+# 6. 加载加速版工作流
+#    workflows/h3-i2v-2080ti-cutlass.json
+```
+
+想改造自己的工作流，别手改 JSON——用脚本注入并做结构自检：
 
 ```bash
-python -c "import torch; print(torch.cuda.get_device_capability(0))"
-# 期望输出 (7, 5)
+python scripts/inject_accel.py --src 我的工作流.json --dry-run
+python scripts/inject_accel.py --src 我的工作流.json --out 加速版.json
 ```
 
-一步到位自检：`python scripts/check_env.py`
-
-### 2. 装加速节点
-
-```bash
-cd ComfyUI/custom_nodes
-
-# sm75 专用注意力 + MLP GEMM 补丁（核心）
-git clone <comfyui-minimax-h3-turing 仓库地址> comfyui-minimax-h3-turing
-
-# 可选：8 步 PDD 蒸馏
-git clone <ComfyUI-MiniMax-H3-PDD-Acc 仓库地址>
-```
-
-> 这些是**第三方节点**，本仓库不重新分发它们的代码，只记录版本与接线。
-> 具体地址见 [docs/03-acceleration-stack.md](docs/03-acceleration-stack.md)。
-
-### 3. 放模型
-
-见 [docs/06-models.md](docs/06-models.md)。关键三条：
-UNET 用 `int8_convrot`，文本编码器用 `int4_convrot`，视频 VAE 用 `fp16`。
-
-### 4. 用加速版启动参数
-
-见 [docs/02-launch-flags.md](docs/02-launch-flags.md)。最小集合：
-
-```
---disable-xformers --disable-pinned-memory
-```
-
-### 5. 加载工作流
-
-打开 [`workflows/h3-i2v-2080ti-cutlass.json`](workflows/h3-i2v-2080ti-cutlass.json)。
-它基于 ComfyUI 官方 H3 I2V 模板，只在 MODEL 链末端多插了一个
-`Patch Turing CUTLASS Attention (sm75)`。
-
-想改造自己的工作流？用脚本注入，别手改 JSON：
-
-```bash
-python scripts/inject_accel.py --src 你的工作流.json --out 加速版.json --dry-run
-python scripts/inject_accel.py --src 你的工作流.json --out 加速版.json
-```
-
-它会找到 MODEL 链进入 sampler/guider 的那个点，插节点、修两端的 link id，并做结构自检
-（手改 JSON 最常见的错误就是把 link 指丢了，ComfyUI 不报错，只是补丁静默失效）。
-
-### 6. 验收
-
-```bash
-# 1) 换一个 seed，别用上一次的
-# 2) 看日志里是否出现 CUTLASS / turing 相关字样
-# 3) 比对产物：时长、帧数、音频轨、MD5
-```
+手改 JSON 最常见的错是只改了一端 link，ComfyUI 不报错，补丁静默失效。
 
 ---
 
 ## 仓库结构
 
 ```
-README.md                      你正在看的
+README.md
 docs/
-  00-hardware.md               2080 Ti 的硬件前提（含 TU102 解锁）
-  01-environment.md            实测版本矩阵：每一项都写死版本号
-  02-launch-flags.md           启动参数逐条解释 + 副作用
-  03-acceleration-stack.md     五层加速：装什么、接什么、参数怎么填
-  03b-sageattention.md         SageAttention 2 在 sm75 上的真相
-  04-benchmarks.md             实测数据与逐阶段拆解
-  05-pitfalls.md               六个坑的完整版
-  06-models.md                 模型清单、来源、放哪个目录
-  07-workflow-wiring.md        节点接线规则与常见错接
+  00-hardware.md          sm75 的边界，TU102 解锁与它的收益天花板
+  01-environment.md       版本矩阵（钉死版本号）+ 两个实例别搞混
+  02-launch-flags.md      启动参数逐条：目的、副作用、别用的
+  03-acceleration-stack.md 四层加速：装什么、接什么、参数怎么填
+  03b-sageattention.md    SageAttention 2 在 sm75 上跑的是什么
+  04-benchmarks.md        实测数据、阶段拆解、测量方法
+  05-pitfalls.md          六个坑：崩溃、NVFP4、头数、缓存、s/it、上下文中毒
+  06-models.md            模型清单、格式选择、来源
+  07-workflow-wiring.md   节点接线规则与两种错接
+  10-frontend-compat.md   连线错乱 / 加载中止 / structuredClone
+  11-workflow-repair.md   下拉值、子图双份、五步验证
+  12-deps-and-download.md 依赖陷阱、HF 镜像、大文件下载
+patches/
+  h3_convrot_warmup/      原生算子加固（dequant）
+  h3_int8_guard/          原生算子加固（rowwise）
 workflows/
-  h3-i2v-2080ti-cutlass.json   基于官方模板的加速版工作流
+  h3-i2v-2080ti-cutlass.json
 scripts/
-  check_env.py                 环境自检，输出可对照的报告
-  inject_accel.py              把加速节点注入任意 H3 工作流
+  check_env.py            环境自检
+  inject_accel.py         加速节点注入 + 结构自检
 ```
 
 ---
 
 ## 关于 TU102 解锁
 
-22G 改卡（TU102）出厂时把 Tensor Core 的 FP16→FP32 累加砍了一半，在 UEFI 阶段可以改回来，
-实测 `mma_peak` 从 65.1 / 67.3 TFLOPS 提到 126.7 / 129.4 TFLOPS。
+22G 改卡出厂把 Tensor Core 的 FP16→FP32 累加砍了一半，UEFI 阶段可以改回来，
+`mma_peak` 从 65.1 / 67.3 提到 126.7 / 129.4 TFLOPS。
 
-但它对视频生成的收益**远小于硬件数字**：这是带宽和显存受限的负载，不是 GEMM 受限。
-是否值得做，见 [docs/00-hardware.md](docs/00-hardware.md) 里的收益边界分析。
+**但对视频生成几乎没有帮助**——这是带宽和显存受限的负载，不是 GEMM 受限。
+实测在 MoE prefill 上只有 +8~13%，decode 完全没变。
+要不要做，见 [docs/00-hardware.md](docs/00-hardware.md) 的收益边界。
 完整方案在另一个仓库：`tu102-22g-windows-unlock`。
 
 ---
 
 ## 致谢
 
-本仓库的所有结论都建立在下列项目之上，加速来自它们，不来自我：
+加速和兼容性来自这些项目，不来自我：
 
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) —— 执行引擎与 H3 支持
-- MiniMax-H3 官方与 comfy-kitchen —— 模型与 int8_convrot 量化算子
-- `comfyui-minimax-h3-turing` —— sm75 的 CUTLASS 注意力核与 MLP GEMM 补丁
-- `ComfyUI-H3-MultiGPU`（H3VM）—— 双卡显存与执行引擎
-- `ComfyUI-MiniMax-H3-PDD-Acc` —— 8 步 / 4 步 PDD 蒸馏 LoRA 支持
-- [Kijai](https://github.com/kijai) 与 `alibaba-pai` —— 实验模型与加速 LoRA
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) — 执行引擎
+- comfy-kitchen / comfy-aimdo — int8 量化算子与显存管理
+- `comfyui-minimax-h3-turing` — sm75 的 CUTLASS 注意力核
+- `ComfyUI-H3-MultiGPU`（H3VM）— 双卡执行引擎
+- `ComfyUI-MiniMax-H3-PDD-Acc` — PDD 蒸馏支持
+- [Kijai](https://github.com/kijai)、`alibaba-pai` — 实验模型与加速 LoRA
+- quick-connections / mixlab / Impact-Pack — 它们的 bug 也教会了我们很多
 
 ## License
 
-文档与脚本：[MIT](LICENSE)。第三方节点与模型的授权请遵循各自仓库。
+文档、脚本与 `patches/`：[MIT](LICENSE)。
+第三方节点与模型的授权请遵循各自仓库。

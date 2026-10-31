@@ -151,6 +151,10 @@ Sol-VAE 是冲着"VAE 解码占 63%"这个事实来的，但需要 ComfyUI ≥ 0
 
 ## 可选：Veda 稀疏注意力
 
+> ⚠️ **上游 Veda 不支持 sm75。** 它的 `docs/hardware.md` 明确写着「SM75 及以下：无 kernel，节点报错」。
+> 本机能跑，是因为补了一套**自研的 sm75 后端**（见下），这部分**不在本仓库范围内**。
+> 直接 `git clone` 上游 Veda 放到 2080 Ti 上，节点会报硬件不支持。
+
 **仅在单卡裸工作流下有效**：
 
 | 配置 | s/it | 端到端 |
@@ -159,6 +163,38 @@ Sol-VAE 是冲着"VAE 解码占 63%"这个事实来的，但需要 ComfyUI ≥ 0
 | Veda（32 tile） | 15.77 | 163.5 s |
 
 但接双卡引擎之后收益归零（±5% 噪声），原因见 [04-benchmarks.md](04-benchmarks.md)。
+
+### 自研 sm75 后端做了什么
+
+上游的注意力路径是 `CUDA sm80+ → triton-int8`。本机把它改成：
+
+```
+CUDA sm75 → cuda-int8-mma-sm75   （张量核 m8n8k16.s8 / m16n8k8.f16，首选）
+          → cuda-int8-sm75       （DP4A 兜底，只在首选编不过时用）
+```
+
+**为什么必须自己写**：Triton 3.7 在 `cc < 8` 上一条张量核指令都不发
+（实测 `mma.sync` 计数 = 0，所有 dot 降级成 `fma.rn.f16`），
+所以 Triton 路径在 Turing 上是结构性不存在，不是被闸门挡住。
+
+涉及文件（升级/重装 Veda 会全部失效）：
+
+| 文件 | 作用 |
+|---|---|
+| `veda_comfy/backends/__init__.py` | 注册表加 `[VEDA-SM75]` 两个后端 |
+| `veda_comfy/backends/cuda_int8.py` | DP4A 后端 |
+| `veda_comfy/backends/cuda_int8_mma.py` | 张量核后端（首选） |
+| `veda_comfy/kernels/sage_cuda/` | `sparse_int8_cuda.py` + `sparse_int8_mma.py` + `src/` |
+
+**怎么判断补丁还在**：节点文本会打印实际 kernel 名，出现
+`Turing CUDA INT8 MMA (sm75)` 或 `CUDA INT8 DP4A (sm75)` 即为生效；
+若报「硬件不支持 / SM80 起」，说明补丁被冲掉了。
+`veda_comfy/backends/` 下存在 `.sm75orig` 备份文件 = 魔改痕迹仍在。
+
+**精度边界**：INT8 Q/K + 每块一个 scale 是格式本身的下限（稠密 ~1.3%，逐点 ~2.7%），
+后端 tolerance 设 0.05。整数路径的精度跳变比 fp16 更硬，商业交付前要跟全注意力比一遍。
+
+### 模型前提
 
 **额外前提**：模型必须是 **56 头**（如 `fl2va_pruned_int8_convrot`）。
 28 头的 fused 融合模型用不了，会报：

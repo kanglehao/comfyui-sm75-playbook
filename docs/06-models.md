@@ -39,6 +39,18 @@ ComfyUI/models/
 
 **合计约 35 GB。**
 
+> 如果多套 ComfyUI 共用模型，把 `models` 做成 junction / 符号链接即可，
+> 不用下两份。判断是链接还是真目录：`fsutil reparsepoint query <path>`。
+
+### 一个要留意的模型
+
+`fastvideo_fasth3_8step_v2_pruned_int8_convrot` 能跑，但它把 `token_refiner` 也量化了，
+于是会走 `quantize_int8_rowwise` 的回退路径——**这个算子需要 `h3_int8_guard` 加固**，
+否则在采样第一步就报 `CUDA INT8 rowwise quantization failed`。
+
+其余 H3 int8 模型的 `token_refiner` 还是 BF16，不会碰这条路径。
+细节见 [05-pitfalls.md](05-pitfalls.md) 坑 #1。
+
 ### 权重格式怎么选
 
 | 格式 | UNET 大小 | sm75 可用 | 备注 |

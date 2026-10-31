@@ -9,112 +9,141 @@
 ### 症状
 
 ```
-CUDA INT8 convrot dequantization failed: invalid argument
+RuntimeError: CUDA INT8 convrot dequantization failed: invalid argument
+Node Type: SamplerCustomAdvanced
 ```
 
-两种触发时机，看起来像两个问题，其实是同一类：
+两种触发形态，看起来像两个问题：
 
 | 形态 | 现象 |
 |---|---|
 | A：进程内首次 | 第一个工作流必崩一次，**再点一次运行就好了** |
-| B：多段生成中途 | 第 1 段完整出片，第 2 段起必崩；有时是第 409 次调用，有时是第 1101 次 |
+| B：跑到中途 | 前面全正常，突然在第 409 次 / 第 1101 次调用上崩 |
 
-形态 B 更像"真 bug"，所以很多人（包括我）会往显存、对齐、流、动态 VRAM 上去猜。
+形态 B 更像"真 bug"，所以很容易往显存、对齐、流、动态 VRAM 上去猜。
+**我们也是这么猜错的。**
 
 ### 已经排除的方向（别再走一遍）
-
-这些全部实测排除，逐条列出来是为了省别人的时间：
 
 - ❌ 全局 sage attention 开关
 - ❌ `comfy-kitchen` 版本（0.2.33 / 0.2.34 / 0.2.35 的 dequant 输出**逐位相同**）
 - ❌ ComfyUI 模型编译器（CUDA Graph）—— 关掉后 `graph breaks` 日志消失，崩溃一模一样
 - ❌ `--cuda-malloc` / aimdo 缓冲区
-- ❌ 指针对齐、张量形状、dtype
+- ❌ 指针对齐、张量形状、dtype、连续性
 - ❌ 共享内存、跨设备 sticky、非默认流
 - ❌ `allocation_context`、遗留 CUDA 错误、图捕获态、driver context 错位
 - ❌ `--disable-dynamic-vram`
 
-### 真正的成因
+以上每一条都有对照实验，不是"觉得不像"。
 
-**进程内第一次原生 kernel launch 的冷启动假失败。**
+### 现在能确定的事实
 
-证据是形态 A 的规律性：每轮恰好只失败 **1 次**，之后全部正常。失败本身把惰性初始化推进到位了，
-所以第二次调用就好了。这解释不了形态 B——但形态 B 的 dump 显示失败也是"偶发一次"，
-重试即过，和形态 A 是同一个冷路径。
+不说"根因是 X"这种过度断言，只列证据能支撑的部分：
 
-### 解法：预热
+1. **所有静态参数在失败现场都合法**——形状、步长、dtype、连续性、16 字节对齐、device、
+   stream、capture 状态，dump 里逐项验过，`peek_last=0 capture=0 drv_ctx_dev=0`
+2. **同一份入参原样重发必定成功**——这是最有价值的一条。它意味着状态是"可恢复"的，
+   而不是输入本身有毒
+3. **失败点不固定**——观测到第 409 次、第 1101 次；不是某个固定形状触发
+4. **与预热无关**——早期版本在开头做了温启动，中途照样炸
 
-在真实 launch 之前，用哑元张量把该 kernel 的冷路径烧掉：
+所以结论只到这一步：**这是一个原生算子在特定时序下返回的偶发错误，入参和版本都没问题。**
+
+早期版本（2026-09-19）曾把它归因为"进程内第一次 kernel launch 的冷启动假失败"。
+2026-09-21 复测推翻了那个说法：温启动成功之后，仍在第 409 次调用崩。
+**别再按"冷启动"去修了。**
+
+### 解法：预热 + 有界重试
+
+组合拳，缺一不可：
+
+| 手段 | 作用 |
+|---|---|
+| 温启动（warm-up） | 覆盖形态 A。用哑元张量先把 kernel 跑一遍 |
+| 有界重试（bounded retry） | 覆盖形态 B。**重试前先 `torch.cuda.synchronize()`**，把驱动侧错误槽里的残留清掉 |
+| 只对已知错误重试 | 用错误信息匹配，其它异常原样抛出 |
+| 重试用尽则抛 | 绝不静默吞错，否则真 bug 会被藏起来 |
+
+代码骨架：
 
 ```python
-def _warm_convrot_dequant():
-    """Run the int8 convrot dequant kernel once per dtype on dummy tensors."""
+TRANSIENT_MARKERS = ("convrot dequantization failed",)
+
+def _drain_device(device):
+    """Retry the sync once: a failing sync is itself the stale-error readout."""
     import torch
-    from comfy_kitchen.backends.cuda import dequantize_int8_convrot_weight
+    for _ in (1, 2):
+        try:
+            torch.cuda.synchronize(device)
+            return
+        except Exception:
+            pass
 
-    q = torch.zeros((256, 256), dtype=torch.int8, device="cuda")
-    scale = torch.ones((), dtype=torch.float32, device="cuda")
-
-    for dtype in (torch.float32, torch.float16, torch.bfloat16):
-        for attempt in range(2):          # 第 1 次本来就应该失败
-            try:
-                dequantize_int8_convrot_weight(q, scale, dtype)
-                break
-            except Exception:
-                if attempt == 1:
-                    raise
+def _call_with_retry(real, args, attempts=3, device=None):
+    for attempt in range(1, attempts + 1):
+        try:
+            return real(*args)
+        except Exception as exc:
+            if not any(m in str(exc) for m in TRANSIENT_MARKERS):
+                raise                      # 不是已知错误，原样抛出
+            if attempt == attempts:
+                raise                      # 次数用尽，抛最后一次
+            _drain_device(device)
+    raise AssertionError("unreachable")
 ```
 
-几个必须遵守的约束：
+三个必须遵守的约束：
 
 | 约束 | 原因 |
 |---|---|
-| 形状必须满足 `gs == 256 and k % 256 == 0` | 否则根本不会走这个 kernel，预热等于没做 |
-| 覆盖 fp32 / fp16 / bf16 三种 dtype | kernel 按 `(group_size, 输出 dtype)` 模板化，gs 恒为 256，只有 dtype 变 |
-| 每设备只做一次 | 代价是 3 次 256×256 调用，可忽略 |
-| **绝不抛异常、绝不碰调用方数据** | 预热失败不应该影响主流程 |
+| **只对白名单错误重试** | 否则会把 OOM、shape 错、权重损坏也重试掉，排查成本翻十倍 |
+| **重试前必须 sync** | 不清错误槽的话，重试会读到同一个残留错误，白试 |
+| **重试要计数并写日志** | 出现 `recovered on attempt N` 就说明这个坑还在，恢复率是健康指标 |
 
-### 验证预热不会改变结果
+### 姊妹算子：`quantize_int8_rowwise` 也会崩
 
-这是最容易漏的一步。做完预热后，用同一个输入跑"开预热"和"关预热"两次，
-比较输出的 **sha256**——必须完全相同。
+同一台机器上还有另一个算子会报同样的 `invalid argument`：
 
-如果不相同，说明你的预热动到了共享状态，比不做更糟。
+```
+RuntimeError: CUDA INT8 rowwise quantization failed: invalid argument
+Node Type: SamplerCustomAdvanced
+```
+
+触发条件是**特定模型的特定结构**：
+
+- 只有 `fastvideo_fasth3_8step_v2_pruned_int8_convrot` 这个模型把 `token_refiner` 也量化了
+  （其余 H3 int8 模型的 `token_refiner` 还是 BF16）
+- 它的 `qkv_proj` 是 `[21504, 5376] int8`，k = 5376
+- Turing 的 `shared_memory_per_block` = 49152（48 KB），fusion 判定算下来要 54272 字节 → 装不下
+- 同时 `_should_use_convrot_fused_kernel` 要求 `k <= 5120 or k >= 8192`，
+  **5376 正好落在被故意跳过的 5120 < k < 8192 区间**
+- 于是必然走回退路径，调用裸的 `quantize_int8_rowwise` —— 而它还没做加固
+
+**结论：同一个加固要打两次，一个给 dequant，一个给 rowwise。**
+只用其中一个，另一个模型照样崩。
 
 ### 怎么部署才不会被升级冲掉
 
-如果你直接改 `site-packages/comfy_kitchen/backends/cuda/__init__.py`，
-下一次 `pip install` 就没了，问题原样复发。
+直接改 `site-packages` 里的文件，下一次 pip 重装就没了，问题原样复发。
 
-关键机制：`comfy_kitchen/registry.py` 的 `get_implementation()` 是**每次调用都 `getattr`**。
+关键机制：`comfy_kitchen/registry.py` 的 `get_implementation()` **每次调用都 `getattr`**。
 所以在包外替换 backend 模块的属性即可生效，且与版本无关。
 
-做成一个独立 custom_node（比如 `h3_convrot_warmup`），在 `__init__.py` 里导入时就完成替换：
+做成独立 custom_node，在 import 时完成替换（完整实现见
+[`patches/`](../patches/README.md)，本仓库直接提供两份可用的）：
 
 ```python
-# custom_nodes/h3_convrot_warmup/__init__.py
-import comfy_kitchen.backends.cuda as ck_cuda
+import comfy_kitchen.backends.cuda as backend
 
-_orig = ck_cuda.dequantize_int8_convrot_weight
-_warmed = False
+_real = getattr(backend, "dequantize_int8_convrot_weight_dtype")
+setattr(backend, "dequantize_int8_convrot_weight_dtype",
+        lambda *a, **kw: _call_with_retry(_real, a, device=...))
 
-def _patched(*args, **kwargs):
-    global _warmed
-    if not _warmed:
-        _warmed = True
-        try:
-            _warm_convrot_dequant()
-        except Exception as e:
-            print(f"[warmup] skipped: {e}")
-    return _orig(*args, **kwargs)
-
-ck_cuda.dequantize_int8_convrot_weight = _patched
-
-NODE_CLASS_MAPPINGS = {}      # 不需要节点，纯副作用
+NODE_CLASS_MAPPINGS = {}      # 不需要 UI 节点，纯副作用
 ```
 
-**要点：`_warm` 里注入的失败必须被吃掉，真实调用里的失败必须原样抛出。**
-如果为了"稳妥"给真实调用也加重试，你会把真 bug 藏起来，调试成本翻十倍。
+`custom_nodes/` 不受 pip 管理、也不会被 ComfyUI 的 git pull 覆盖，
+所以这里的加固在"安装/修复依赖"之后依然存活。
 
 ---
 
@@ -128,7 +157,7 @@ H3 的官方模板默认用 `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`。
 qwen3vl_32b_minimax_h3_int4_convrot.safetensors
 ```
 
-这个坑的恶劣之处在于它是一个 **32 GB 的下载**——很多人下完了才发现跑不了。
+这个坑的恶劣之处在于它是一个 **14 GB 的下载**——很多人下完了才发现跑不了。
 
 同理，UNET 也不要选任何 `nvfp4` 版本。
 
@@ -154,6 +183,9 @@ This model has 50 x 28 x 128, but the predictor was trained for 50 x 56 x 128
 
 **这个报错曾被误判成 kernel 不兼容**，白查了一轮。
 只要看到 `predictor was trained for` 这类字样，先去核对头数。
+
+另外 `PatchTuringCutlassAttention` 有硬约束：**`head_dim` 必须 = 128**，
+否则 `RuntimeError: head_dim must be 128`。H3 正好是 128，换模型前要确认。
 
 ---
 
@@ -210,13 +242,17 @@ H3VM 是异步流水。进度条显示的是"已提交的步"，不是"已完成
 **不要试图在同一个进程里恢复。** CUDA 上下文中毒是不可逆的，
 继续尝试只会让错误信息越来越偏离真相。
 
+> 注意区分：坑 #1 的"原样重发必定成功"讲的是**那一次原生调用**，不是整个工作流。
+> 工作流级崩溃之后，进程已经不可信了，该重启还是要重启。
+
 ---
 
 ## 附：还有几个地方会浪费你半天
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 日志出现 `Skip .../veda_sm75 module ... due to the lack of NODE_CLASS_MAPPINGS` | 0.37 加载器先打 ERROR 再走 `comfy_entrypoint` 分支 | **误导性报错**。查 `/object_info` 是否有该节点，有就是正常的 |
+| 日志出现 `Skip .../veda_sm75 module ... due to the lack of NODE_CLASS_MAPPINGS` | 加载器先打 ERROR 再走 `comfy_entrypoint` 分支 | **误导性报错**。查 `/object_info` 是否有该节点，有就是正常的 |
+| 裸脚本 import Turing 节点报 `DLL load failed` | `.pyd` 依赖 torch 先加载 | **必须先 `import torch` 再 import 节点**。ComfyUI 里正常，裸诊断时会误判成"内核坏了" |
 | 注意力补丁"装上了但没生效" | 节点放错位置（在 LoRA 之前 / guider 之后） | 必须在 MODEL 链最末端 |
 | 补丁节点接完就报 `'H3SnapshotPrefixProxy' object has no attribute 'attn'` | 接在 H3VM 引擎之后了 | 挪到引擎之前 |
 | `VAE is invalid: None` | 选了 Sol-VAE，ComfyUI < 0.44 不支持 | 换回 `minimax_h3_video_vae_fp16` |

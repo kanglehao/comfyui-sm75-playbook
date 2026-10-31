@@ -1,18 +1,23 @@
 # 02 · 启动参数
 
-## 实测使用的最小集合
+## 实测使用的四个
 
 ```
---disable-xformers --disable-pinned-memory
+--disable-xformers --disable-pinned-memory --disable-dynamic-vram --cuda-device all
 ```
 
-双卡再加一个：
+单卡可以去掉 `--cuda-device all`，其余三个保留。
 
-```
---cuda-device all
-```
+这四个不是拍脑袋凑的。前两个决定**注意力走哪条路**，后两个决定**显存怎么管**：
 
-就这三个。其他的都是历史遗留或者排障时临时加的。
+| 参数 | 管什么 | 去掉会怎样 |
+|---|---|---|
+| `--disable-xformers` | 注意力后端 | CUTLASS 补丁被抢接管权，静默失效 |
+| `--disable-pinned-memory` | 锁页内存 | 长跑后加载阶段卡死或崩 |
+| `--disable-dynamic-vram` | 显存页调度 | aimdo 激进回收与 int8 原生核冲突 |
+| `--cuda-device all` | 设备可见性 | 双卡引擎找不到第二张卡 |
+
+下面逐条说清目的和副作用。
 
 ---
 
@@ -87,18 +92,23 @@ print(mm.sage_attention_enabled())        # True 才算开了
 
 ---
 
-### `--disable-dynamic-vram`（历史遗留，可加可不加）
+### `--disable-dynamic-vram`
 
-**做什么**：关闭 ComfyUI 0.37 引入的 DynamicVRAM（`comfy_aimdo`）。
+**做什么**：关闭 ComfyUI 0.37 引入的 DynamicVRAM（`comfy_aimdo`），让权重按传统方式常驻/换出。
 
-**为什么曾经加**：H3 的 int8_convrot 在多段生成时崩溃，怀疑是 DynamicVRAM 把权重页
-unpin 之后，原生 kernel 直接拿到未映射的地址。
+**为什么加**：22 GB 的改卡上，DynamicVRAM 的按页 pin/unpin 太激进——
+它会在段与段之间回收权重页，而 H3 的 int8 原生核直接拿张量地址去 launch，
+不经过 comfy 的 `vbar_fault` 补页路径。配套的 `--disable-pinned-memory` 是同一个目的：
+别让 aimdo 的缓冲策略和原生核抢内存。
 
-**实测结果**：**没能挡住崩溃**。参数确实进了进程命令行，但工作流照样崩在
-第 409 次 convrot 反量化调用上（另一轮是第 1101 次）。
+**它不解决 convrot 崩溃。** 这一点必须说清楚：参数确实进了进程命令行，
+工作流照样崩在原生算子上。真正止血的是预热 + 有界重试补丁
+（见 [05-pitfalls.md](05-pitfalls.md) 坑 #1）。
 
-> 现在它是**无害但无用**的状态。真正止血的是预热钩子，见 [05-pitfalls.md](05-pitfalls.md) 坑 #1。
-> 如果你不需要多段生成，可以直接去掉这个参数，让 DynamicVRAM 正常工作（大分辨率下更省显存）。
+> 所以别把这两件事混在一起：`--disable-dynamic-vram` 管的是**显存策略稳定性**，
+> 补丁管的是**原生算子的偶发失败**。少了任何一个，你都还会崩。
+
+**副作用**：显存调度不如动态模式灵活，超大分辨率下更容易 OOM。这是 22G 卡上的取舍。
 
 ---
 
