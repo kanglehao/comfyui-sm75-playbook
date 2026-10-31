@@ -1,0 +1,13 @@
+# Keep line endings stable across Windows/Linux checkouts.
+# The scripts carry shebangs and are expected to run on both.
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.mp4  binary
