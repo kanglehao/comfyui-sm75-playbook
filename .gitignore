@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+venv/
+
+# ComfyUI runtime junk
+output/
+temp/
+input/
+user/
+*.log
+
+# Never commit weights or media
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.mp4
+*.webm
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
